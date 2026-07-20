@@ -1,29 +1,58 @@
 # zstd_dart
 
-Zstd compression and decompression for Dart, using native build hooks to compile the [zstd C library](https://github.com/facebook/zstd) at build time via `package:native_toolchain_c`.
+Zstandard compression for Dart with one-shot and stateful streaming APIs. The bundled zstd C sources are compiled by a native build hook.
 
-## Usage
+## One-shot usage
 
 ```dart
 import 'dart:typed_data';
+
 import 'package:zstd_dart/zstd_dart.dart';
 
-// Compress
 final input = Uint8List.fromList([1, 2, 3, 4, 5]);
 final compressed = ZstdCodec.compress(input);
-
-// Decompress
 final decompressed = ZstdCodec.decompress(compressed);
 
-// Custom compression level (1-22, default 3)
+// Compression levels range from 1 through 22. The default is 3.
 final highCompression = ZstdCodec.compress(input, level: 19);
 ```
 
+## Continuous streaming
+
+Use one encoder and one decoder for the lifetime of a continuous connection-level stream. Each `compress` call flushes the bytes for one transport message without ending the zstd frame. Later compressed messages can depend on earlier stream state, so they are not independently decodable with `ZstdCodec.decompress` or a fresh decoder.
+
+```dart
+final encoder = ZstdStreamEncoder();
+final decoder = ZstdStreamDecoder();
+try {
+  final firstMessage = Uint8List.fromList([1, 2, 3]);
+  final secondMessage = Uint8List.fromList([4, 5, 6]);
+
+  final firstDecoded = decoder.feed(encoder.compress(firstMessage));
+  final secondDecoded = decoder.feed(encoder.compress(secondMessage));
+
+  assert(firstDecoded.length == firstMessage.length);
+  assert(secondDecoded.length == secondMessage.length);
+} finally {
+  encoder.dispose();
+  decoder.dispose();
+}
+```
+
+Call `reset` on both sides when the protocol starts a fresh stream, such as after reconnecting. Call `dispose` when the connection closes to release the native contexts. Disposal is idempotent. Using an encoder or decoder after disposal throws `ZstdStreamException`.
+
+The decoder's `maxDecompressedMessageSize` is a corruption guard applied separately to the output of each `feed` call. It defaults to 64 MiB and is not a total stream limit or protocol payload limit. Set it to the largest decompressed transport message your application accepts. The encoder has a matching `maxCompressedMessageSize` output guard. Exceeding either configured guard throws `ZstdStreamException`.
+
+## Error semantics
+
+A `ZstdStreamException` from `compress` or `feed` poisons that instance. Further calls throw `StateError` until `reset()`. Reset starts a new stream and discards prior context, so transport-level consumers should typically drop the connection instead of continuing on the same stream.
+
 ## How it works
 
-The package uses Dart's native build hooks (`package:hooks`) to compile zstd C sources from `third_party/zstd/` into a shared library at build time. FFI bindings in `lib/src/zstd_bindings.dart` use `@Native` annotations to link to the compiled library automatically.
+The package includes zstd C sources under `third_party/zstd/`. Dart's native build hooks compile the required sources into a shared library through `package:native_toolchain_c`. FFI bindings in `lib/src/zstd_bindings.dart` use `@Native` annotations to link to that library automatically. The build hook does not download sources at build time.
 
 ## Requirements
 
 - Dart SDK `>=3.10.0`
-- A C compiler available on the build host (provided by the Dart/Flutter toolchain)
+- Android, iOS, Linux, macOS, or Windows
+- A C compiler available on the build host
