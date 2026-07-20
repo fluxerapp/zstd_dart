@@ -40,19 +40,23 @@ try {
 }
 ```
 
-For a file or independently decodable frame, append the bytes from `end()` to the bytes returned by prior `compress` calls. Unlike a flush, `end()` closes the frame. Further `compress()` or `end()` calls throw `StateError` until `reset()` starts a new stream.
+For a file or independently decodable frame, append the bytes from encoder `end()` to the bytes returned by prior `compress` calls, feed the complete frame to the decoder, then call decoder `finish()`. Unlike a flush, `end()` closes the frame. Decoder `finish()` checks that the stream ended on a frame boundary and rejects truncated input. Further `compress()`/`end()` on the encoder and `feed()`/`finish()` on the decoder throw `StateError` until `reset()` starts a new stream. Transport streams (for example a gateway) that keep a frame open across messages call neither `end()` nor `finish()`.
 
 ```dart
 final fileEncoder = ZstdStreamEncoder(level: 5);
+final fileDecoder = ZstdStreamDecoder();
 try {
   final frame = Uint8List.fromList([
     ...fileEncoder.compress(input),
     ...fileEncoder.end(),
   ]);
-  final restored = ZstdCodec.decompress(frame);
+  final restored = fileDecoder.feed(frame);
+  fileDecoder.finish();
   assert(restored.length == input.length);
+  assert(fileDecoder.isFrameComplete);
 } finally {
   fileEncoder.dispose();
+  fileDecoder.dispose();
 }
 ```
 
@@ -62,7 +66,7 @@ The decoder's `maxDecompressedMessageSize` is a corruption guard applied separat
 
 ## Error semantics
 
-A `ZstdStreamException` from `compress`, `end`, or `feed` poisons that instance. Further calls throw `StateError` until `reset()`. Reset starts a new stream and discards prior context, so transport-level consumers should typically drop the connection instead of continuing on the same stream.
+A `ZstdStreamException` from `compress`, `end`, `feed`, or `finish` poisons that instance. Further calls throw `StateError` until `reset()`. Reset starts a new stream and discards prior context, so transport-level consumers should typically drop the connection instead of continuing on the same stream.
 
 ## Runtime version
 

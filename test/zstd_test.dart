@@ -470,6 +470,150 @@ void main() {
       final payload = Uint8List.fromList([1, 2, 3]);
       expect(decoder.feed(encoder.compress(payload)), equals(payload));
     });
+
+    test('finish accepts a complete ended frame', () {
+      final encoder = ZstdStreamEncoder();
+      final decoder = ZstdStreamDecoder();
+      addTearDown(encoder.dispose);
+      addTearDown(decoder.dispose);
+
+      final input = Uint8List.fromList([1, 2, 3, 4, 5, 6, 7, 8]);
+      final frame = Uint8List.fromList([
+        ...encoder.compress(input),
+        ...encoder.end(),
+      ]);
+
+      expect(decoder.feed(frame), equals(input));
+      expect(decoder.isFrameComplete, isTrue);
+      expect(decoder.finish, returnsNormally);
+
+      expect(
+        () => decoder.feed(Uint8List.fromList([1])),
+        throwsA(
+          isA<StateError>().having(
+            (error) => error.message,
+            'message',
+            contains('reset()'),
+          ),
+        ),
+      );
+      expect(
+        decoder.finish,
+        throwsA(
+          isA<StateError>().having(
+            (error) => error.message,
+            'message',
+            contains('reset()'),
+          ),
+        ),
+      );
+
+      decoder.reset();
+      encoder.reset();
+      final next = Uint8List.fromList([9, 8, 7]);
+      final nextFrame = Uint8List.fromList([
+        ...encoder.compress(next),
+        ...encoder.end(),
+      ]);
+      expect(decoder.feed(nextFrame), equals(next));
+      expect(decoder.isFrameComplete, isTrue);
+      expect(decoder.finish, returnsNormally);
+    });
+
+    test('finish rejects a truncated frame and poisons', () {
+      final encoder = ZstdStreamEncoder();
+      final decoder = ZstdStreamDecoder();
+      addTearDown(encoder.dispose);
+      addTearDown(decoder.dispose);
+
+      final input = Uint8List.fromList(
+        List<int>.generate(1024, (index) => index % 251),
+      );
+      final frame = Uint8List.fromList([
+        ...encoder.compress(input),
+        ...encoder.end(),
+      ]);
+      expect(frame.length, greaterThan(4));
+      final truncated = Uint8List.sublistView(frame, 0, frame.length - 4);
+
+      decoder.feed(truncated);
+      expect(decoder.isFrameComplete, isFalse);
+      expect(
+        decoder.finish,
+        throwsA(
+          isA<ZstdStreamException>().having(
+            (error) => error.message,
+            'message',
+            contains('Truncated'),
+          ),
+        ),
+      );
+      expect(
+        () => decoder.feed(Uint8List.fromList([1])),
+        throwsA(
+          isA<StateError>().having(
+            (error) => error.message,
+            'message',
+            contains('reset()'),
+          ),
+        ),
+      );
+
+      decoder.reset();
+      expect(decoder.isFrameComplete, isTrue);
+      expect(decoder.feed(frame), equals(input));
+      expect(decoder.isFrameComplete, isTrue);
+      expect(decoder.finish, returnsNormally);
+    });
+
+    test('flush-only transport chunks leave frame incomplete', () {
+      final encoder = ZstdStreamEncoder();
+      final decoder = ZstdStreamDecoder();
+      addTearDown(encoder.dispose);
+      addTearDown(decoder.dispose);
+
+      final first = Uint8List.fromList([1, 2, 3]);
+      final second = Uint8List.fromList([4, 5, 6]);
+
+      expect(decoder.feed(encoder.compress(first)), equals(first));
+      expect(decoder.isFrameComplete, isFalse);
+      expect(decoder.feed(encoder.compress(second)), equals(second));
+      expect(decoder.isFrameComplete, isFalse);
+    });
+
+    test('finish accepts complete frame with exact 64 KiB output', () {
+      final encoder = ZstdStreamEncoder();
+      final decoder = ZstdStreamDecoder();
+      addTearDown(encoder.dispose);
+      addTearDown(decoder.dispose);
+
+      final input = Uint8List(65536);
+      final frame = Uint8List.fromList([
+        ...encoder.compress(input),
+        ...encoder.end(),
+      ]);
+
+      expect(decoder.feed(frame), equals(input));
+      expect(decoder.isFrameComplete, isTrue);
+      expect(decoder.finish, returnsNormally);
+    });
+
+    test('finish accepts complete frame with exact 128 KiB output', () {
+      final encoder = ZstdStreamEncoder();
+      final decoder = ZstdStreamDecoder();
+      addTearDown(encoder.dispose);
+      addTearDown(decoder.dispose);
+
+      final input = Uint8List(131072);
+      final frame = Uint8List.fromList([
+        ...encoder.compress(input),
+        ...encoder.end(),
+      ]);
+
+      expect(decoder.feed(frame), equals(input));
+      expect(decoder.isFrameComplete, isTrue);
+      expect(decoder.finish, returnsNormally);
+    });
   });
 }
 

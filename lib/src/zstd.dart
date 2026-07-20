@@ -471,9 +471,15 @@ class ZstdStreamEncoder {
 /// Each [feed] call returns only the bytes produced from that compressed
 /// chunk. The decoder context is retained until [reset] or [dispose].
 ///
-/// After a [ZstdStreamException] from [feed], the instance is poisoned and
-/// rejects further use until [reset]. Reset starts a new stream and drops prior
-/// context, so transport consumers should usually discard the connection instead.
+/// For open transports (for example a gateway WebSocket), call [feed] for
+/// each message and neither [finish] nor the encoder's [ZstdStreamEncoder.end].
+/// For finite streams, pair encoder [ZstdStreamEncoder.end] with decoder
+/// [finish] so truncation is detected.
+///
+/// After a [ZstdStreamException] from [feed] or [finish], the instance is
+/// poisoned and rejects further use until [reset]. Reset starts a new stream
+/// and drops prior context, so transport consumers should usually discard the
+/// connection instead.
 class ZstdStreamDecoder {
   /// Default guard against runaway allocation from corrupted stream data.
   ///
@@ -489,6 +495,10 @@ class ZstdStreamDecoder {
   bool _disposed = false;
   // Native stream state is already partially advanced when feed fails.
   bool _poisoned = false;
+  bool _ended = false;
+  // Last ZSTD_decompressStream return. Zero means the decoder sits at a frame
+  // boundary (also the initial and post-reset state).
+  int _lastResultHint = 0;
 
   /// Creates a decoder with a per-message decompressed output guard.
   ///
@@ -505,6 +515,14 @@ class ZstdStreamDecoder {
     }
     _context = _createContext();
   }
+
+  /// Whether the decoder currently sits at a zstd frame boundary.
+  ///
+  /// True in the initial state, after [reset], and when the last native
+  /// decompress call returned zero. Open transports that only flush (and never
+  /// call encoder [ZstdStreamEncoder.end]) will typically observe `false`
+  /// mid-stream; that is normal and not an error.
+  bool get isFrameComplete => _lastResultHint == 0;
 
   /// Decompresses the next chunk from the current stream.
   ///
@@ -547,6 +565,7 @@ class ZstdStreamDecoder {
           _poisoned = true;
           throw ZstdStreamException(ZSTD_getErrorName(result).toDartString());
         }
+        _lastResultHint = result;
 
         final produced = output.ref.pos;
         if (decodedLength + produced > maxDecompressedMessageSize) {
@@ -575,6 +594,12 @@ class ZstdStreamDecoder {
           decodedLength = requiredLength;
         }
 
+        // Frame complete with all input consumed: stop before another
+        // decompress call at a fresh frame boundary can overwrite the hint.
+        if (result == 0 && input.ref.pos == input.ref.size) {
+          break;
+        }
+
         if (input.ref.pos == inputPosition &&
             produced == 0 &&
             input.ref.pos < input.ref.size) {
@@ -592,6 +617,24 @@ class ZstdStreamDecoder {
     }
   }
 
+  /// Marks a finite stream complete after the final compressed bytes.
+  ///
+  /// Throws [ZstdStreamException] when the decoder is not at a frame boundary
+  /// (truncated input). That is a data error: the instance is poisoned until
+  /// [reset].
+  ///
+  /// On success, further [feed] and [finish] calls throw [StateError] until
+  /// [reset] starts a new stream. Open transports that never end a frame
+  /// should not call this method.
+  void finish() {
+    _ensureUsable();
+    if (!isFrameComplete) {
+      _poisoned = true;
+      throw const ZstdStreamException('Truncated zstd stream');
+    }
+    _ended = true;
+  }
+
   /// Replaces the decoder context with a fresh stream.
   ///
   /// Clears a prior poison state. Prior stream context is discarded.
@@ -603,6 +646,8 @@ class ZstdStreamDecoder {
     ZSTD_freeDCtx(_context);
     _context = replacement;
     _poisoned = false;
+    _ended = false;
+    _lastResultHint = 0;
   }
 
   /// Releases the native decoder context.
@@ -630,6 +675,12 @@ class ZstdStreamDecoder {
     if (_poisoned) {
       throw StateError(
         'ZstdStreamDecoder is poisoned after a failed feed; '
+        'call reset() to start a new stream',
+      );
+    }
+    if (_ended) {
+      throw StateError(
+        'ZstdStreamDecoder has finished; '
         'call reset() to start a new stream',
       );
     }
