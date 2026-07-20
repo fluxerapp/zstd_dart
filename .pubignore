@@ -1,2 +1,13 @@
 .dart_tool/
 build/
+third_party/zstd/build/
+third_party/zstd/contrib/
+third_party/zstd/doc/
+third_party/zstd/examples/
+third_party/zstd/programs/
+third_party/zstd/tests/
+third_party/zstd/zlibWrapper/
+third_party/zstd/lib/deprecated/
+third_party/zstd/lib/dictBuilder/
+third_party/zstd/lib/dll/
+third_party/zstd/lib/legacy/
