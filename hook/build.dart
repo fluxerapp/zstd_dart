@@ -23,6 +23,8 @@ void main(List<String> args) async {
         'ZSTD_MULTITHREAD': '0',
         'ZSTD_LEGACY_SUPPORT': '0',
         'ZSTD_DISABLE_ASM': '1',
+        // MSVC needs dllexport; without it the DLL exports nothing and dart:ffi lookups fail.
+        if (input.config.code.targetOS == OS.windows) 'ZSTD_DLL_EXPORT': '1',
       },
     );
 
