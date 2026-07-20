@@ -42,6 +42,23 @@ const int zstdEEnd = 2;
 /// Compression-level parameter for [ZSTD_CCtx_setParameter].
 const int zstdCCompressionLevel = 100;
 
+/// Returns the minimum supported compression level.
+@Native<Int32 Function()>()
+external int ZSTD_minCLevel();
+
+/// Returns the maximum supported compression level.
+@Native<Int32 Function()>()
+external int ZSTD_maxCLevel();
+
+/// Returns the runtime zstd version encoded as major * 10000 + minor * 100 +
+/// patch.
+@Native<Uint32 Function()>()
+external int ZSTD_versionNumber();
+
+/// Returns the runtime zstd version as a dotted string.
+@Native<Pointer<Utf8> Function()>()
+external Pointer<Utf8> ZSTD_versionString();
+
 /// Maximum compressed size for a given source size.
 @Native<Size Function(Size)>()
 external int ZSTD_compressBound(int srcSize);

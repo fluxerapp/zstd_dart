@@ -48,10 +48,32 @@ class ZstdStreamException extends ZstdException {
   String toString() => 'ZstdStreamException: $message';
 }
 
+void _validateCompressionLevel(int level) {
+  final minimum = ZSTD_minCLevel();
+  final maximum = ZSTD_maxCLevel();
+  if (level < minimum || level > maximum) {
+    throw ArgumentError.value(
+      level,
+      'level',
+      'must be between $minimum and $maximum',
+    );
+  }
+}
+
+/// Information about the bundled zstd runtime.
+abstract final class ZstdVersion {
+  /// The runtime version encoded as `major * 10000 + minor * 100 + patch`.
+  static int get number => ZSTD_versionNumber();
+
+  /// The runtime version as a dotted string, such as `1.5.7`.
+  static String get string => ZSTD_versionString().toDartString();
+}
+
 /// Zstd compression and decompression.
 class ZstdCodec {
-  /// Compresses [input] using zstd at the given [level] (1-22, default 3).
+  /// Compresses [input] using zstd at the given [level] (default 3).
   static Uint8List compress(Uint8List input, {int level = 3}) {
+    _validateCompressionLevel(level);
     final srcSize = input.length;
     final bound = ZSTD_compressBound(srcSize);
 
@@ -234,35 +256,39 @@ class ZstdCodec {
 /// Stateful encoder for a continuous zstd stream.
 ///
 /// Each [compress] call flushes the bytes for one transport message without
-/// ending the stream. The encoder context is retained until [reset] or
-/// [dispose].
+/// ending the stream. [end] closes the frame. The encoder context is retained
+/// until [reset] or [dispose].
 ///
-/// After a [ZstdStreamException] from [compress], the instance is poisoned and
-/// rejects further use until [reset]. Reset starts a new stream and drops prior
-/// context, so transport consumers should usually discard the connection instead.
+/// After a [ZstdStreamException] from [compress] or [end], the instance is
+/// poisoned and rejects further use until [reset]. Reset starts a new stream
+/// and drops prior context, so transport consumers should usually discard the
+/// connection instead.
 class ZstdStreamEncoder {
   /// Default guard against runaway allocation after a native stream failure.
   ///
   /// This is not a protocol limit.
   static const int defaultMaxCompressedMessageSize = 64 * 1024 * 1024;
 
-  static const int _compressionLevel = 3;
   static const int _nativeOutputSize = 64 * 1024;
+  final int _level;
 
   /// Maximum compressed output accepted from one input message.
   final int maxCompressedMessageSize;
 
   Pointer<ZSTD_CCtx> _context = nullptr;
   bool _disposed = false;
-  // Native stream state is already partially advanced when compress fails.
+  // Native stream state is already partially advanced when compression fails.
   bool _poisoned = false;
+  bool _ended = false;
 
-  /// Creates an encoder with a per-message compressed output guard.
+  /// Creates an encoder with a compression [level] and per-message output guard.
   ///
+  /// [level] defaults to 3 and must be in zstd's supported range.
   /// [maxCompressedMessageSize] must be greater than zero.
   ZstdStreamEncoder({
+    int level = 3,
     this.maxCompressedMessageSize = defaultMaxCompressedMessageSize,
-  }) {
+  }) : _level = level {
     if (maxCompressedMessageSize <= 0) {
       throw ArgumentError.value(
         maxCompressedMessageSize,
@@ -270,15 +296,34 @@ class ZstdStreamEncoder {
         'must be greater than zero',
       );
     }
-    _context = _createContext();
+    _validateCompressionLevel(level);
+    _context = _createContext(level);
   }
 
   /// Compresses and flushes the next chunk in the current stream.
   ///
+  /// A flush keeps the frame open for continuous transports. Call [end] when
+  /// the frame must be closed for a file or independently decodable frame.
+  ///
   /// After a [ZstdStreamException], this encoder is poisoned until [reset].
   Uint8List compress(Uint8List chunk) {
     _ensureUsable();
+    return _compress(chunk, zstdEFlush);
+  }
 
+  /// Closes the current frame and returns its final compressed bytes.
+  ///
+  /// After this succeeds, [compress] and [end] throw [StateError] until
+  /// [reset] starts a new stream. A [ZstdStreamException] poisons the encoder
+  /// until [reset].
+  Uint8List end() {
+    _ensureUsable();
+    final result = _compress(Uint8List(0), zstdEEnd);
+    _ended = true;
+    return result;
+  }
+
+  Uint8List _compress(Uint8List chunk, int endDirective) {
     final source = calloc<Uint8>(chunk.length);
     final nativeOutput = calloc<Uint8>(_nativeOutputSize);
     final input = calloc<ZSTD_inBuffer>();
@@ -304,7 +349,7 @@ class ZstdStreamEncoder {
       while (input.ref.pos < input.ref.size || remaining != 0) {
         final inputPosition = input.ref.pos;
         output.ref.pos = 0;
-        remaining = ZSTD_compressStream2(_context, output, input, zstdEFlush);
+        remaining = ZSTD_compressStream2(_context, output, input, endDirective);
         if (ZSTD_isError(remaining) != 0) {
           _poisoned = true;
           throw ZstdStreamException(
@@ -362,15 +407,16 @@ class ZstdStreamEncoder {
 
   /// Replaces the encoder context with a fresh stream.
   ///
-  /// Clears a prior poison state. Prior stream context is discarded.
+  /// Clears a prior poison or ended state. Prior stream context is discarded.
   void reset() {
     if (_disposed) {
       throw const ZstdStreamException('Encoder has been disposed');
     }
-    final replacement = _createContext();
+    final replacement = _createContext(_level);
     ZSTD_freeCCtx(_context);
     _context = replacement;
     _poisoned = false;
+    _ended = false;
   }
 
   /// Releases the native encoder context.
@@ -383,7 +429,7 @@ class ZstdStreamEncoder {
     _context = nullptr;
   }
 
-  static Pointer<ZSTD_CCtx> _createContext() {
+  static Pointer<ZSTD_CCtx> _createContext(int level) {
     final context = ZSTD_createCCtx();
     if (context == nullptr) {
       throw const ZstdStreamException('Failed to create compression context');
@@ -391,7 +437,7 @@ class ZstdStreamEncoder {
     final result = ZSTD_CCtx_setParameter(
       context,
       zstdCCompressionLevel,
-      _compressionLevel,
+      level,
     );
     if (ZSTD_isError(result) != 0) {
       final message = ZSTD_getErrorName(result).toDartString();
@@ -407,7 +453,13 @@ class ZstdStreamEncoder {
     }
     if (_poisoned) {
       throw StateError(
-        'ZstdStreamEncoder is poisoned after a failed compress; '
+        'ZstdStreamEncoder is poisoned after failed compression; '
+        'call reset() to start a new stream',
+      );
+    }
+    if (_ended) {
+      throw StateError(
+        'ZstdStreamEncoder has ended; '
         'call reset() to start a new stream',
       );
     }

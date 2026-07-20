@@ -7,6 +7,9 @@
 - Add `ZstdStreamException`, stream reset support, and idempotent native context disposal.
 - Make stream failure states explicit: after a `ZstdStreamException`, the encoder or decoder is poisoned until `reset()`.
 - Bound one-shot decompression output while supporting unknown-size frames independently of compression ratio.
+- Add native-range validation for one-shot and streaming compression levels.
+- Add `ZstdStreamEncoder.end()` to close streams as complete zstd frames.
+- Add `ZstdVersion.number` and `ZstdVersion.string` runtime version accessors.
 
 ## 1.0.0
 

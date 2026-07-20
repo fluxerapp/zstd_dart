@@ -4,6 +4,7 @@ library zstd_dart;
 export 'src/zstd.dart'
     show
         ZstdCodec,
+        ZstdVersion,
         ZstdException,
         ZstdStreamDecoder,
         ZstdStreamEncoder,

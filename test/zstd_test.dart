@@ -129,6 +129,24 @@ void main() {
         final max = ZstdCodec.compress(input, level: 22);
         expect(max.length, lessThanOrEqualTo(fast.length));
       });
+      test('validates the native compression-level bounds', () {
+        final minimum = ZSTD_minCLevel();
+        final maximum = ZSTD_maxCLevel();
+        final input = Uint8List.fromList([1, 2, 3, 4]);
+
+        for (final level in [minimum, maximum]) {
+          final compressed = ZstdCodec.compress(input, level: level);
+          expect(ZstdCodec.decompress(compressed), equals(input));
+        }
+        expect(
+          () => ZstdCodec.compress(input, level: minimum - 1),
+          throwsArgumentError,
+        );
+        expect(
+          () => ZstdCodec.compress(input, level: maximum + 1),
+          throwsArgumentError,
+        );
+      });
     });
 
     group('error handling', () {
@@ -168,7 +186,109 @@ void main() {
     });
   });
 
+  group('ZstdVersion', () {
+    test('matches the bundled zstd version', () {
+      expect(ZstdVersion.number, greaterThanOrEqualTo(10000));
+      expect(ZstdVersion.number, 10507);
+      expect(ZstdVersion.string, '1.5.7');
+    });
+  });
+
   group('Zstd streaming', () {
+    test('validates encoder compression-level bounds', () {
+      final minimum = ZSTD_minCLevel();
+      final maximum = ZSTD_maxCLevel();
+
+      for (final level in [minimum, maximum]) {
+        final encoder = ZstdStreamEncoder(level: level);
+        addTearDown(encoder.dispose);
+        expect(encoder.compress(Uint8List.fromList([1, 2, 3])), isNotEmpty);
+      }
+      expect(() => ZstdStreamEncoder(level: minimum - 1), throwsArgumentError);
+      expect(() => ZstdStreamEncoder(level: maximum + 1), throwsArgumentError);
+    });
+
+    test('end closes a frame for one-shot decompression', () {
+      final encoder = ZstdStreamEncoder();
+      addTearDown(encoder.dispose);
+      final input = Uint8List.fromList(
+        List<int>.generate(200000, (index) => index % 251),
+      );
+
+      final flushed = encoder.compress(input);
+      expect(
+        () => ZstdCodec.decompress(flushed),
+        throwsA(isA<ZstdException>()),
+      );
+
+      final ending = encoder.end();
+      final frame = Uint8List(flushed.length + ending.length)
+        ..setRange(0, flushed.length, flushed)
+        ..setRange(flushed.length, flushed.length + ending.length, ending);
+      expect(ZstdCodec.decompress(frame), equals(input));
+    });
+
+    test('compress and end reject use after end', () {
+      final encoder = ZstdStreamEncoder();
+      addTearDown(encoder.dispose);
+
+      encoder.compress(Uint8List.fromList([1, 2, 3]));
+      encoder.end();
+
+      for (final operation in [
+        () => encoder.compress(Uint8List.fromList([4])),
+        encoder.end,
+      ]) {
+        expect(
+          operation,
+          throwsA(
+            isA<StateError>().having(
+              (error) => error.message,
+              'message',
+              contains('reset()'),
+            ),
+          ),
+        );
+      }
+    });
+
+    test('end failure poisons the encoder until reset', () {
+      final encoder = ZstdStreamEncoder(maxCompressedMessageSize: 1);
+      addTearDown(encoder.dispose);
+
+      expect(encoder.end, throwsA(isA<ZstdStreamException>()));
+      expect(
+        encoder.end,
+        throwsA(
+          isA<StateError>().having(
+            (error) => error.message,
+            'message',
+            contains('reset()'),
+          ),
+        ),
+      );
+
+      encoder.reset();
+      expect(encoder.end, throwsA(isA<ZstdStreamException>()));
+    });
+
+    test('reset recovers an ended encoder', () {
+      final encoder = ZstdStreamEncoder();
+      addTearDown(encoder.dispose);
+
+      encoder.compress(Uint8List.fromList([1, 2, 3]));
+      encoder.end();
+      encoder.reset();
+
+      final input = Uint8List.fromList([9, 8, 7, 6]);
+      final flushed = encoder.compress(input);
+      final ending = encoder.end();
+      final frame = Uint8List(flushed.length + ending.length)
+        ..setRange(0, flushed.length, flushed)
+        ..setRange(flushed.length, flushed.length + ending.length, ending);
+      expect(ZstdCodec.decompress(frame), equals(input));
+    });
+
     test('retains context across flushed WebSocket messages', () {
       final encoder = ZstdStreamEncoder();
       final decoder = ZstdStreamDecoder();
