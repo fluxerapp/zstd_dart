@@ -1,7 +1,10 @@
+import 'dart:ffi';
 import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:test/test.dart';
+import 'package:ffi/ffi.dart';
+import 'package:zstd_dart/src/zstd_bindings.dart';
 import 'package:zstd_dart/zstd_dart.dart';
 
 void main() {
@@ -52,6 +55,54 @@ void main() {
         final decompressed = ZstdCodec.decompress(compressed);
         expect(decompressed, equals(input));
       });
+    });
+
+    group('bounded decompression', () {
+      test('rejects advertised content size above the output guard', () {
+        final input = Uint8List(8192);
+        final compressed = ZstdCodec.compress(input);
+
+        expect(_frameContentSize(compressed), input.length);
+        expect(
+          () => ZstdCodec.decompress(compressed, maxOutputBytes: 1024),
+          throwsA(isA<ZstdException>()),
+        );
+      });
+
+      test('decodes a high-ratio frame with unknown content size', () {
+        final input = Uint8List(512 * 1024);
+        final compressed = _compressUnknownContentSize(input);
+
+        expect(_frameContentSize(compressed), _zstdContentSizeUnknown);
+        expect(compressed.length * 8, lessThan(input.length));
+        expect(ZstdCodec.decompress(compressed), equals(input));
+      });
+
+      test(
+        'rejects a truncated unknown-size frame but accepts it complete',
+        () {
+          final input = Uint8List(128 * 1024);
+          final compressed = _compressUnknownContentSize(input);
+          final truncated = Uint8List.sublistView(
+            compressed,
+            0,
+            compressed.length - 1,
+          );
+
+          expect(_frameContentSize(compressed), _zstdContentSizeUnknown);
+          expect(ZstdCodec.decompress(compressed), equals(input));
+          expect(
+            () => ZstdCodec.decompress(truncated),
+            throwsA(
+              isA<ZstdException>().having(
+                (error) => error.message,
+                'message',
+                equals('Truncated zstd frame'),
+              ),
+            ),
+          );
+        },
+      );
     });
 
     group('compression levels', () {
@@ -300,4 +351,81 @@ void main() {
       expect(decoder.feed(encoder.compress(payload)), equals(payload));
     });
   });
+}
+
+const _zstdContentSizeUnknown = -1;
+const _zstdCContentSizeFlag = 200;
+
+int _frameContentSize(Uint8List frame) {
+  final source = calloc<Uint8>(frame.length);
+  try {
+    source.asTypedList(frame.length).setAll(0, frame);
+    return ZSTD_getFrameContentSize(source.cast(), frame.length);
+  } finally {
+    calloc.free(source);
+  }
+}
+
+Uint8List _compressUnknownContentSize(Uint8List input) {
+  final context = ZSTD_createCCtx();
+  if (context == nullptr) {
+    throw StateError('Failed to create fixture compression context');
+  }
+
+  final source = calloc<Uint8>(input.length);
+  final destinationCapacity = ZSTD_compressBound(input.length);
+  final destination = calloc<Uint8>(destinationCapacity);
+  final inputBuffer = calloc<ZSTD_inBuffer>();
+  final outputBuffer = calloc<ZSTD_outBuffer>();
+
+  try {
+    final parameterResult = ZSTD_CCtx_setParameter(
+      context,
+      _zstdCContentSizeFlag,
+      0,
+    );
+    if (ZSTD_isError(parameterResult) != 0) {
+      throw StateError(ZSTD_getErrorName(parameterResult).toDartString());
+    }
+
+    source.asTypedList(input.length).setAll(0, input);
+    inputBuffer.ref
+      ..src = source.cast()
+      ..size = input.length
+      ..pos = 0;
+    outputBuffer.ref
+      ..dst = destination.cast()
+      ..size = destinationCapacity
+      ..pos = 0;
+
+    var remaining = 1;
+    while (remaining != 0) {
+      final inputPosition = inputBuffer.ref.pos;
+      final outputPosition = outputBuffer.ref.pos;
+      remaining = ZSTD_compressStream2(
+        context,
+        outputBuffer,
+        inputBuffer,
+        zstdEEnd,
+      );
+      if (ZSTD_isError(remaining) != 0) {
+        throw StateError(ZSTD_getErrorName(remaining).toDartString());
+      }
+      if (inputBuffer.ref.pos == inputPosition &&
+          outputBuffer.ref.pos == outputPosition) {
+        throw StateError('Fixture compressor made no progress');
+      }
+      if (outputBuffer.ref.pos == outputBuffer.ref.size && remaining != 0) {
+        throw StateError('Fixture compression buffer is too small');
+      }
+    }
+
+    return Uint8List.fromList(destination.asTypedList(outputBuffer.ref.pos));
+  } finally {
+    calloc.free(outputBuffer);
+    calloc.free(inputBuffer);
+    calloc.free(destination);
+    calloc.free(source);
+    ZSTD_freeCCtx(context);
+  }
 }

@@ -6,6 +6,7 @@
 - Add configurable 64 MiB default guards for compressed and decompressed per-message output.
 - Add `ZstdStreamException`, stream reset support, and idempotent native context disposal.
 - Make stream failure states explicit: after a `ZstdStreamException`, the encoder or decoder is poisoned until `reset()`.
+- Bound one-shot decompression output while supporting unknown-size frames independently of compression ratio.
 
 ## 1.0.0
 

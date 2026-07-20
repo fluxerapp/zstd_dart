@@ -9,6 +9,23 @@ const _contentSizeUnknown = -1; // 0xFFFFFFFFFFFFFFFF as signed
 
 /// Sentinel: error reading frame header.
 const _contentSizeError = -2; // 0xFFFFFFFFFFFFFFFE as signed
+Uint8List _growOutputBuffer(
+  Uint8List buffer,
+  int usedLength,
+  int requiredLength,
+  int maximumLength,
+) {
+  var nextLength = buffer.isEmpty ? 1 : buffer.length;
+  while (nextLength < requiredLength) {
+    nextLength = nextLength > maximumLength ~/ 2
+        ? maximumLength
+        : nextLength * 2;
+  }
+
+  final grown = Uint8List(nextLength);
+  grown.setRange(0, usedLength, buffer);
+  return grown;
+}
 
 /// Exception thrown when zstd operations fail.
 class ZstdException implements Exception {
@@ -67,8 +84,23 @@ class ZstdCodec {
 
   /// Decompresses zstd-compressed [input].
   ///
-  /// Throws [ZstdException] if the input is corrupted or invalid.
-  static Uint8List decompress(Uint8List input) {
+  /// [maxOutputBytes] limits decompressed output and defaults to 64 MiB. The
+  /// limit guards allocations from untrusted frame data; it is not a zstd
+  /// protocol limit.
+  ///
+  /// Throws [ZstdException] if the input is corrupted, truncated, or expands
+  /// beyond [maxOutputBytes].
+  static Uint8List decompress(
+    Uint8List input, {
+    int maxOutputBytes = ZstdStreamDecoder.defaultMaxDecompressedMessageSize,
+  }) {
+    if (maxOutputBytes <= 0) {
+      throw ArgumentError.value(
+        maxOutputBytes,
+        'maxOutputBytes',
+        'must be greater than zero',
+      );
+    }
     if (input.isEmpty) return Uint8List(0);
 
     final srcSize = input.length;
@@ -78,36 +110,123 @@ class ZstdCodec {
       src.asTypedList(srcSize).setAll(0, input);
 
       final contentSize = ZSTD_getFrameContentSize(src.cast(), srcSize);
-
       if (contentSize == _contentSizeError) {
         throw const ZstdException('Not valid zstd data');
       }
+      if (contentSize == _contentSizeUnknown) {
+        return _decompressUnknownSize(src, srcSize, maxOutputBytes);
+      }
+      if (contentSize > maxOutputBytes) {
+        throw ZstdException(
+          'Decompressed output exceeds the $maxOutputBytes byte limit',
+        );
+      }
 
-      // If size is unknown, use a heuristic (srcSize * 8, min 64KB).
-      final dstCapacity = contentSize == _contentSizeUnknown
-          ? (srcSize * 8).clamp(65536, 1 << 30)
-          : contentSize;
-
-      final dst = calloc<Uint8>(dstCapacity);
-
+      final dst = calloc<Uint8>(contentSize);
       try {
         final result = ZSTD_decompress(
           dst.cast(),
-          dstCapacity,
+          contentSize,
           src.cast(),
           srcSize,
         );
-
         if (ZSTD_isError(result) != 0) {
           throw ZstdException(ZSTD_getErrorName(result).toDartString());
         }
-
         return Uint8List.fromList(dst.asTypedList(result));
       } finally {
         calloc.free(dst);
       }
     } finally {
       calloc.free(src);
+    }
+  }
+
+  static Uint8List _decompressUnknownSize(
+    Pointer<Uint8> source,
+    int sourceLength,
+    int maxOutputBytes,
+  ) {
+    final context = ZSTD_createDCtx();
+    if (context == nullptr) {
+      throw const ZstdException('Failed to create decompression context');
+    }
+
+    final nativeOutputSize =
+        maxOutputBytes < ZstdStreamDecoder._nativeOutputSize
+        ? maxOutputBytes
+        : ZstdStreamDecoder._nativeOutputSize;
+    final nativeOutput = calloc<Uint8>(nativeOutputSize);
+    final input = calloc<ZSTD_inBuffer>();
+    final output = calloc<ZSTD_outBuffer>();
+
+    try {
+      input.ref
+        ..src = source.cast()
+        ..size = sourceLength
+        ..pos = 0;
+      output.ref
+        ..dst = nativeOutput.cast()
+        ..size = nativeOutputSize
+        ..pos = 0;
+
+      var decoded = Uint8List(nativeOutputSize);
+      var decodedLength = 0;
+      var result = 1;
+
+      while (true) {
+        final inputPosition = input.ref.pos;
+        output.ref.pos = 0;
+        result = ZSTD_decompressStream(context, output, input);
+        if (ZSTD_isError(result) != 0) {
+          throw ZstdException(ZSTD_getErrorName(result).toDartString());
+        }
+
+        final produced = output.ref.pos;
+        if (decodedLength + produced > maxOutputBytes) {
+          throw ZstdException(
+            'Decompressed output exceeds the $maxOutputBytes byte limit',
+          );
+        }
+
+        final requiredLength = decodedLength + produced;
+        if (requiredLength > decoded.length) {
+          decoded = _growOutputBuffer(
+            decoded,
+            decodedLength,
+            requiredLength,
+            maxOutputBytes,
+          );
+        }
+        if (produced > 0) {
+          decoded.setRange(
+            decodedLength,
+            requiredLength,
+            nativeOutput.asTypedList(produced),
+          );
+          decodedLength = requiredLength;
+        }
+
+        if (result == 0 && input.ref.pos == input.ref.size) {
+          break;
+        }
+        if (input.ref.pos == input.ref.size && produced < nativeOutputSize) {
+          break;
+        }
+        if (input.ref.pos == inputPosition && produced == 0) {
+          throw const ZstdException('Decoder made no progress');
+        }
+      }
+
+      if (result != 0) {
+        throw const ZstdException('Truncated zstd frame');
+      }
+      return Uint8List.sublistView(decoded, 0, decodedLength);
+    } finally {
+      calloc.free(output);
+      calloc.free(input);
+      calloc.free(nativeOutput);
+      ZSTD_freeDCtx(context);
     }
   }
 }
@@ -388,16 +507,12 @@ class ZstdStreamDecoder {
 
         final requiredLength = decodedLength + produced;
         if (requiredLength > decoded.length) {
-          var nextLength = decoded.length * 2;
-          while (nextLength < requiredLength) {
-            nextLength *= 2;
-          }
-          if (nextLength > maxDecompressedMessageSize) {
-            nextLength = maxDecompressedMessageSize;
-          }
-          final grown = Uint8List(nextLength);
-          grown.setRange(0, decodedLength, decoded);
-          decoded = grown;
+          decoded = _growOutputBuffer(
+            decoded,
+            decodedLength,
+            requiredLength,
+            maxDecompressedMessageSize,
+          );
         }
         if (produced > 0) {
           decoded.setRange(
